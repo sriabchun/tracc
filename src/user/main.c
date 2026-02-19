@@ -20,12 +20,19 @@
 #define DIR_INGRESS 1
 #define DIR_EGRESS  2
 
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t reload_flag = 0;
 
 static void sig_handler(int sig)
 {
 	(void)sig;
 	running = 0;
+}
+
+static void sighup_handler(int sig)
+{
+	(void)sig;
+	reload_flag = 1;
 }
 
 /* --- Configuration --- */
@@ -382,6 +389,75 @@ static int populate_infra(int map_fd, int map6_fd,
 			}
 		}
 	}
+	return 0;
+}
+
+/* --- Config reload (SIGHUP) --- */
+
+static void clear_lpm_map4(int fd)
+{
+	struct lpm_key key;
+	while (bpf_map_get_next_key(fd, NULL, &key) == 0)
+		bpf_map_delete_elem(fd, &key);
+}
+
+static void clear_lpm_map6(int fd)
+{
+	struct lpm_key6 key;
+	while (bpf_map_get_next_key(fd, NULL, &key) == 0)
+		bpf_map_delete_elem(fd, &key);
+}
+
+static int reload_config(const char *config_path, struct app_config *cfg,
+			 int config_fd, int regions_fd, int regions6_fd,
+			 int dst_infra_fd, int dst_infra6_fd)
+{
+	struct app_config new_cfg = {};
+	if (parse_config(config_path, &new_cfg) < 0) {
+		fprintf(stderr, "SIGHUP: failed to parse config, keeping old\n");
+		return -1;
+	}
+
+	/* Warn about immutable fields */
+	if (strcmp(new_cfg.ifname, cfg->ifname) != 0)
+		fprintf(stderr, "SIGHUP: 'interface' change ignored (requires restart)\n");
+	if (new_cfg.direction != cfg->direction)
+		fprintf(stderr, "SIGHUP: 'direction' change ignored (requires restart)\n");
+	if (strcmp(new_cfg.collector, cfg->collector) != 0 ||
+	    new_cfg.collector_port != cfg->collector_port)
+		fprintf(stderr, "SIGHUP: 'collector' change ignored (requires restart)\n");
+	if (new_cfg.my_region_id != cfg->my_region_id)
+		fprintf(stderr, "SIGHUP: 'my_region_id' change ignored (requires restart)\n");
+
+	/* Update config map (vxlan_port, vxlan_vni) */
+	populate_config_map(config_fd, &new_cfg);
+
+	/* Clear and repopulate LPM maps */
+	clear_lpm_map4(regions_fd);
+	clear_lpm_map6(regions6_fd);
+	clear_lpm_map4(dst_infra_fd);
+	clear_lpm_map6(dst_infra6_fd);
+
+	populate_regions(regions_fd, regions6_fd,
+			 new_cfg.regions, new_cfg.n_regions);
+	populate_infra(dst_infra_fd, dst_infra6_fd,
+		       new_cfg.infra, new_cfg.n_infra);
+
+	/* Update mutable fields */
+	cfg->vxlan_port = new_cfg.vxlan_port;
+	cfg->vxlan_vni = new_cfg.vxlan_vni;
+	cfg->poll_interval = new_cfg.poll_interval;
+
+	/* Swap region/infra arrays */
+	free(cfg->regions);
+	free(cfg->infra);
+	cfg->regions = new_cfg.regions;
+	cfg->n_regions = new_cfg.n_regions;
+	cfg->infra = new_cfg.infra;
+	cfg->n_infra = new_cfg.n_infra;
+
+	printf("SIGHUP: config reloaded (%d regions, %d infra CIDRs)\n",
+	       cfg->n_regions, cfg->n_infra);
 	return 0;
 }
 
@@ -935,12 +1011,22 @@ int main(int argc, char **argv)
 	/* Signal handlers */
 	signal(SIGINT, sig_handler);
 	signal(SIGTERM, sig_handler);
+	signal(SIGHUP, sighup_handler);
 
 	/* Main polling loop */
 	while (running) {
 		sleep(cfg.poll_interval);
 		if (!running)
 			break;
+		if (reload_flag) {
+			reload_flag = 0;
+			/* Flush counters before reload — region IDs may change */
+			poll_counters(outer_v4, outer_v6, outer_vni, &cur,
+				      exp_ptr, verbose, cfg.direction);
+			reload_config(config_path, &cfg, config_fd,
+				      regions_fd, regions6_fd,
+				      dst_infra_fd, dst_infra6_fd);
+		}
 		poll_counters(outer_v4, outer_v6, outer_vni, &cur,
 			      exp_ptr, verbose, cfg.direction);
 	}
