@@ -1,0 +1,50 @@
+# Sample configuration for nft-traffic-account
+# Lines starting with # are comments
+
+[general]
+interface   eth0
+vxlan_port  4789
+vxlan_vni   100       # only account packets with this VNI
+my_region_id 0x00010101  # this sender's full location: region_id | (AZ << 16)
+poll_interval 30
+direction     both  # both, ingress, or egress
+collector   10.0.0.100:4739  # IPFIX collector IP[:port] (default port: 4739, omit to disable)
+
+# Destination subnet regions
+# [region Continent/Name] — public subnets for inner traffic accounting (region_id)
+#   id 0xXXYY — 0xXX = continent code [1..255], 0xYY = region code [1..255]
+# [region Continent/Name/N] — infrastructure subnets for per-VNI accounting
+#   dst_region_id auto-calculated as region_id | (N << 16), no id line needed
+# Supports both IPv4 and IPv6 CIDRs
+# Packets not matching any region get region_id = 0xFFFFFFFF (4294967295)
+
+[region Europa/FRA]
+id 0x0101
+192.168.0.0/16
+192.168.100.0/24
+10.10.0.0/16
+
+[region Europa/FRA/1]
+10.100.0.0/16
+
+[region Europa/FRA/2]
+10.101.0.0/16
+
+[region US-East/NYC]
+id 0x0201
+10.0.0.0/8
+172.16.0.0/12
+
+[region US-East/NYC/1]
+10.200.0.0/16
+2001:db8:200::/48
+
+[region Asia/TKO]
+id 0x0301
+2001:db8::/32
+fd00::/8
+
+[region Catchall/Default]
+id 0x00FF
+0.0.0.0/0
+::/0
