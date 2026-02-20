@@ -92,9 +92,9 @@ The BPF object file (`traffic_account.bpf.o`) must be in the working directory.
 ### Console (verbose mode)
 
 ```
-2026-02-12T12:00:00+0000 dir=egress ip=10.0.0.1 region=257 packets=154230 bytes=198456320
-2026-02-12T12:00:00+0000 dir=ingress ip=fd00::1 region=513 packets=8420 bytes=12630000
-2026-02-12T12:00:00+0000 dir=egress vni=200 dst_region_id=65793 packets=5000 bytes=7500000
+2026-02-12T12:00:00+0000 dir=egress ip=10.0.0.1 region=0x00000101 packets=154230 bytes=198456320
+2026-02-12T12:00:00+0000 dir=ingress ip=fd00::1 region=0x00000201 packets=8420 bytes=12630000
+2026-02-12T12:00:00+0000 dir=egress vni=200 dst_region_id=0x00010101 packets=5000 bytes=7500000
 ```
 
 ### IPFIX
