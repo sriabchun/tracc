@@ -415,6 +415,7 @@ static int reload_config(const char *config_path, struct app_config *cfg,
 	struct app_config new_cfg = {};
 	if (parse_config(config_path, &new_cfg) < 0) {
 		fprintf(stderr, "SIGHUP: failed to parse config, keeping old\n");
+		config_free(&new_cfg);
 		return -1;
 	}
 

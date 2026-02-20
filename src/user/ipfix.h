@@ -69,7 +69,7 @@ void ipfix_send_templates(struct ipfix_exporter *exp);
 
 /*
  * Export counter records via IPFIX.
- * dir: 0 = egress, 1 = ingress
+ * dir: 0 = ingress, 1 = egress (IPFIX IE 61 flowDirection)
  */
 void ipfix_export_v4(struct ipfix_exporter *exp, uint32_t ip, uint32_t dst_region_id,
 		     uint64_t packets, uint64_t bytes, uint8_t dir);
