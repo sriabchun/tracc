@@ -1,4 +1,4 @@
-# Sample configuration for nft-traffic-account
+# Sample configuration for VXLAN traffic account
 # Lines starting with # are comments
 
 [general]

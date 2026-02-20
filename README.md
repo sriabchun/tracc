@@ -1,4 +1,4 @@
-# nft-traffic-account
+# VXLAN traffic account
 
 High-performance VXLAN traffic accounting using XDP/eBPF. Accounts packets and bytes per `[source_IP, dst_region_id]` pair by parsing inner (encapsulated) headers. Exports via IPFIX to a remote collector.
 

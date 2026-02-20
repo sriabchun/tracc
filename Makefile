@@ -1,4 +1,4 @@
-# nft-traffic-account - VXLAN Traffic Accounting
+# VXLAN traffic account
 
 CLANG      ?= clang
 LLVM_STRIP ?= llvm-strip
