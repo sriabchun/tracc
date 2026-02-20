@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <signal.h>
+#include <stdbool.h>
 #include <time.h>
 #include <arpa/inet.h>
 #include <net/if.h>
@@ -15,10 +16,13 @@
 #include <bpf/bpf.h>
 #include "../common.h"
 #include "ipfix.h"
+#include "traffic_account.skel.h"
 
 #define DIR_BOTH    0
 #define DIR_INGRESS 1
 #define DIR_EGRESS  2
+
+#define BATCH_SIZE  256
 
 static volatile sig_atomic_t running = 1;
 static volatile sig_atomic_t reload_flag = 0;
@@ -320,20 +324,6 @@ static int parse_config(const char *path, struct app_config *cfg)
 
 /* --- Map population --- */
 
-static int populate_config_map(int map_fd, struct app_config *cfg)
-{
-	__u32 key, val;
-
-	key = CFG_VXLAN_PORT;
-	val = cfg->vxlan_port;
-	if (bpf_map_update_elem(map_fd, &key, &val, BPF_ANY) < 0)
-		return -1;
-
-	key = CFG_VXLAN_VNI;
-	val = cfg->vxlan_vni;
-	return bpf_map_update_elem(map_fd, &key, &val, BPF_ANY);
-}
-
 static int populate_regions(int map_fd, int map6_fd,
 			    struct subnet_region *regions, int count)
 {
@@ -409,7 +399,8 @@ static void clear_lpm_map6(int fd)
 }
 
 static int reload_config(const char *config_path, struct app_config *cfg,
-			 int config_fd, int regions_fd, int regions6_fd,
+			 struct traffic_account_bpf *skel,
+			 int regions_fd, int regions6_fd,
 			 int dst_infra_fd, int dst_infra6_fd)
 {
 	struct app_config new_cfg = {};
@@ -430,8 +421,9 @@ static int reload_config(const char *config_path, struct app_config *cfg,
 	if (new_cfg.my_region_id != cfg->my_region_id)
 		fprintf(stderr, "SIGHUP: 'my_region_id' change ignored (requires restart)\n");
 
-	/* Update config map (vxlan_port, vxlan_vni) */
-	populate_config_map(config_fd, &new_cfg);
+	/* Update BPF globals (mmap'd, immediately visible to BPF) */
+	skel->data->cfg_vxlan_port = new_cfg.vxlan_port;
+	skel->bss->cfg_vxlan_vni = new_cfg.vxlan_vni;
 
 	/* Clear and repopulate LPM maps */
 	clear_lpm_map4(regions_fd);
@@ -549,116 +541,163 @@ static void close_inner_maps(struct inner_map_fds *fds)
 	if (fds->vni >= 0) { close(fds->vni); fds->vni = -1; }
 }
 
-/* --- Counter polling --- */
+/* --- Counter polling (batch iteration) --- */
 
 static void poll_counters_v4(int map_fd, const char *timebuf, const char *dir,
-			    struct ipfix_exporter *exp, int verbose,
-			    struct counter_val *vals, int ncpus)
+			     struct ipfix_exporter *exp, int verbose, int ncpus)
 {
-	struct counter_key key = {}, next_key;
 	uint8_t ipfix_dir = (strcmp(dir, "ingress") == 0) ? 0 : 1;
 
-	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
-		if (bpf_map_lookup_elem(map_fd, &next_key, vals) == 0) {
+	struct counter_key keys[BATCH_SIZE];
+	struct counter_val *vals = calloc(BATCH_SIZE * ncpus, sizeof(*vals));
+	if (!vals) return;
+
+	LIBBPF_OPTS(bpf_map_batch_opts, opts);
+	void *in_batch = NULL, *out_batch = NULL;
+	bool first = true;
+
+	for (;;) {
+		__u32 count = BATCH_SIZE;
+		int ret = bpf_map_lookup_batch(map_fd,
+			first ? NULL : &in_batch, &out_batch,
+			keys, vals, &count, &opts);
+
+		for (__u32 i = 0; i < count; i++) {
+			struct counter_val *cpu_vals = &vals[i * ncpus];
 			__u64 total_pkts = 0, total_bytes = 0;
-			for (int i = 0; i < ncpus; i++) {
-				total_pkts += vals[i].packets;
-				total_bytes += vals[i].bytes;
+			for (int c = 0; c < ncpus; c++) {
+				total_pkts += cpu_vals[c].packets;
+				total_bytes += cpu_vals[c].bytes;
 			}
 
 			if (total_pkts > 0) {
 				if (exp)
-					ipfix_export_v4(exp, next_key.src_ip,
-							next_key.dst_region_id,
+					ipfix_export_v4(exp, keys[i].src_ip,
+							keys[i].dst_region_id,
 							total_pkts, total_bytes,
 							ipfix_dir);
 				if (verbose) {
 					char ip_str[INET_ADDRSTRLEN];
-					struct in_addr sa = { .s_addr = next_key.src_ip };
+					struct in_addr sa = { .s_addr = keys[i].src_ip };
 					inet_ntop(AF_INET, &sa, ip_str, sizeof(ip_str));
 					printf("%s dir=%s ip=%s region=0x%08x packets=%llu bytes=%llu\n",
-					       timebuf, dir, ip_str, next_key.dst_region_id,
+					       timebuf, dir, ip_str, keys[i].dst_region_id,
 					       (unsigned long long)total_pkts,
 					       (unsigned long long)total_bytes);
 				}
 			}
 		}
 
-		key = next_key;
+		if (ret < 0)
+			break;
+		in_batch = out_batch;
+		first = false;
 	}
+	free(vals);
 }
 
 static void poll_counters_v6(int map_fd, const char *timebuf, const char *dir,
-			    struct ipfix_exporter *exp, int verbose,
-			    struct counter_val *vals, int ncpus)
+			     struct ipfix_exporter *exp, int verbose, int ncpus)
 {
-	struct counter_key6 key = {}, next_key;
 	uint8_t ipfix_dir = (strcmp(dir, "ingress") == 0) ? 0 : 1;
 
-	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
-		if (bpf_map_lookup_elem(map_fd, &next_key, vals) == 0) {
+	struct counter_key6 keys[BATCH_SIZE];
+	struct counter_val *vals = calloc(BATCH_SIZE * ncpus, sizeof(*vals));
+	if (!vals) return;
+
+	LIBBPF_OPTS(bpf_map_batch_opts, opts);
+	void *in_batch = NULL, *out_batch = NULL;
+	bool first = true;
+
+	for (;;) {
+		__u32 count = BATCH_SIZE;
+		int ret = bpf_map_lookup_batch(map_fd,
+			first ? NULL : &in_batch, &out_batch,
+			keys, vals, &count, &opts);
+
+		for (__u32 i = 0; i < count; i++) {
+			struct counter_val *cpu_vals = &vals[i * ncpus];
 			__u64 total_pkts = 0, total_bytes = 0;
-			for (int i = 0; i < ncpus; i++) {
-				total_pkts += vals[i].packets;
-				total_bytes += vals[i].bytes;
+			for (int c = 0; c < ncpus; c++) {
+				total_pkts += cpu_vals[c].packets;
+				total_bytes += cpu_vals[c].bytes;
 			}
 
 			if (total_pkts > 0) {
 				if (exp)
-					ipfix_export_v6(exp, next_key.src_ip6,
-							next_key.dst_region_id,
+					ipfix_export_v6(exp, keys[i].src_ip6,
+							keys[i].dst_region_id,
 							total_pkts, total_bytes,
 							ipfix_dir);
 				if (verbose) {
 					char ip_str[INET6_ADDRSTRLEN];
-					inet_ntop(AF_INET6, next_key.src_ip6,
+					inet_ntop(AF_INET6, keys[i].src_ip6,
 						  ip_str, sizeof(ip_str));
 					printf("%s dir=%s ip=%s region=0x%08x packets=%llu bytes=%llu\n",
-					       timebuf, dir, ip_str, next_key.dst_region_id,
+					       timebuf, dir, ip_str, keys[i].dst_region_id,
 					       (unsigned long long)total_pkts,
 					       (unsigned long long)total_bytes);
 				}
 			}
 		}
 
-		key = next_key;
+		if (ret < 0)
+			break;
+		in_batch = out_batch;
+		first = false;
 	}
+	free(vals);
 }
 
 static void poll_vni_counters(int map_fd, const char *timebuf,
-			      struct ipfix_exporter *exp, int verbose,
-			      struct counter_val *vals, int ncpus)
+			      struct ipfix_exporter *exp, int verbose, int ncpus)
 {
-	struct vni_counter_key key = {}, next_key;
+	struct vni_counter_key keys[BATCH_SIZE];
+	struct counter_val *vals = calloc(BATCH_SIZE * ncpus, sizeof(*vals));
+	if (!vals) return;
 
-	while (bpf_map_get_next_key(map_fd, &key, &next_key) == 0) {
-		if (bpf_map_lookup_elem(map_fd, &next_key, vals) == 0) {
+	LIBBPF_OPTS(bpf_map_batch_opts, opts);
+	void *in_batch = NULL, *out_batch = NULL;
+	bool first = true;
+
+	for (;;) {
+		__u32 count = BATCH_SIZE;
+		int ret = bpf_map_lookup_batch(map_fd,
+			first ? NULL : &in_batch, &out_batch,
+			keys, vals, &count, &opts);
+
+		for (__u32 i = 0; i < count; i++) {
+			struct counter_val *cpu_vals = &vals[i * ncpus];
 			__u64 total_pkts = 0, total_bytes = 0;
-			for (int i = 0; i < ncpus; i++) {
-				total_pkts += vals[i].packets;
-				total_bytes += vals[i].bytes;
+			for (int c = 0; c < ncpus; c++) {
+				total_pkts += cpu_vals[c].packets;
+				total_bytes += cpu_vals[c].bytes;
 			}
 
 			if (total_pkts > 0) {
 				if (exp)
-					ipfix_export_vni(exp, next_key.vni,
-							 next_key.dst_region_id,
+					ipfix_export_vni(exp, keys[i].vni,
+							 keys[i].dst_region_id,
 							 total_pkts, total_bytes,
-							 next_key.dir ? 0 : 1);
+							 keys[i].dir ? 0 : 1);
 				if (verbose) {
 					printf("%s dir=%s vni=%u dst_region_id=0x%08x packets=%llu bytes=%llu\n",
 					       timebuf,
-					       next_key.dir ? "ingress" : "egress",
-					       next_key.vni,
-					       next_key.dst_region_id,
+					       keys[i].dir ? "ingress" : "egress",
+					       keys[i].vni,
+					       keys[i].dst_region_id,
 					       (unsigned long long)total_pkts,
 					       (unsigned long long)total_bytes);
 				}
 			}
 		}
 
-		key = next_key;
+		if (ret < 0)
+			break;
+		in_batch = out_batch;
+		first = false;
 	}
+	free(vals);
 }
 
 /*
@@ -666,7 +705,7 @@ static void poll_vni_counters(int map_fd, const char *timebuf,
  * 1. Create fresh empty inner maps
  * 2. Swap them into the outer ARRAY_OF_MAPS
  * 3. Wait for in-flight BPF programs to drain (RCU grace period)
- * 4. Iterate the old maps (read-only, no deletes needed)
+ * 4. Iterate the old maps (batch read, no deletes needed)
  * 5. Export via IPFIX
  * 6. Close old maps (kernel frees them)
  */
@@ -702,37 +741,29 @@ static void poll_counters(int outer_v4, int outer_v6, int outer_vni,
 	strftime(timebuf, sizeof(timebuf), "%Y-%m-%dT%H:%M:%S%z", tm);
 
 	int ncpus = libbpf_num_possible_cpus();
-	struct counter_val *vals = calloc(ncpus, sizeof(struct counter_val));
-	if (!vals) {
-		fprintf(stderr, "Failed to allocate per-CPU buffer\n");
-		close_inner_maps(&old);
-		return;
-	}
 
 	if (exp)
 		ipfix_send_templates(exp);
 
 	if (direction != DIR_INGRESS) {
 		poll_counters_v4(old.v4[0], timebuf, "egress", exp, verbose,
-				 vals, ncpus);
+				 ncpus);
 		poll_counters_v6(old.v6[0], timebuf, "egress", exp, verbose,
-				 vals, ncpus);
+				 ncpus);
 	}
 	if (direction != DIR_EGRESS) {
 		poll_counters_v4(old.v4[1], timebuf, "ingress", exp, verbose,
-				 vals, ncpus);
+				 ncpus);
 		poll_counters_v6(old.v6[1], timebuf, "ingress", exp, verbose,
-				 vals, ncpus);
+				 ncpus);
 	}
-	poll_vni_counters(old.vni, timebuf, exp, verbose, vals, ncpus);
+	poll_vni_counters(old.vni, timebuf, exp, verbose, ncpus);
 
 	if (exp)
 		ipfix_flush(exp);
 
 	if (verbose)
 		fflush(stdout);
-
-	free(vals);
 
 	/* Close old maps — kernel frees them */
 	close_inner_maps(&old);
@@ -856,85 +887,62 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	/* Open and load BPF object */
-	struct bpf_object *obj = bpf_object__open("traffic_account.bpf.o");
-	if (!obj) {
-		fprintf(stderr, "Failed to open BPF object: %s\n", strerror(errno));
+	/* Open BPF skeleton (object is embedded in binary) */
+	struct traffic_account_bpf *skel = traffic_account_bpf__open();
+	if (!skel) {
+		fprintf(stderr, "Failed to open BPF skeleton: %s\n", strerror(errno));
 		config_free(&cfg);
 		return 1;
 	}
 
-	if (bpf_object__load(obj) < 0) {
+	/* Set BPF globals before load */
+	skel->data->cfg_vxlan_port = cfg.vxlan_port;
+	skel->bss->cfg_vxlan_vni = cfg.vxlan_vni;
+
+	if (traffic_account_bpf__load(skel) < 0) {
 		fprintf(stderr, "Failed to load BPF object: %s\n", strerror(errno));
-		bpf_object__close(obj);
+		traffic_account_bpf__destroy(skel);
 		config_free(&cfg);
 		return 1;
 	}
 
-	/* Find programs */
-	struct bpf_program *xdp_prog = bpf_object__find_program_by_name(obj, "xdp_traffic_account");
-	struct bpf_program *tc_prog = bpf_object__find_program_by_name(obj, "tc_traffic_account");
-	if (!xdp_prog || !tc_prog) {
-		fprintf(stderr, "Failed to find BPF programs\n");
-		bpf_object__close(obj);
-		config_free(&cfg);
-		return 1;
-	}
+	/* Get LPM map fds */
+	int regions_fd = bpf_map__fd(skel->maps.dst_region_map);
+	int regions6_fd = bpf_map__fd(skel->maps.dst_region_map6);
+	int dst_infra_fd = bpf_map__fd(skel->maps.dst_infra_map);
+	int dst_infra6_fd = bpf_map__fd(skel->maps.dst_infra_map6);
 
-	/* Find static maps (config, LPM, infra) */
-	int config_fd = bpf_object__find_map_fd_by_name(obj, "config");
-	int regions_fd = bpf_object__find_map_fd_by_name(obj, "dst_region_map");
-	int regions6_fd = bpf_object__find_map_fd_by_name(obj, "dst_region_map6");
-	int dst_infra_fd = bpf_object__find_map_fd_by_name(obj, "dst_infra_map");
-	int dst_infra6_fd = bpf_object__find_map_fd_by_name(obj, "dst_infra_map6");
-
-	if (config_fd < 0 || regions_fd < 0 || regions6_fd < 0 ||
-	    dst_infra_fd < 0 || dst_infra6_fd < 0) {
-		fprintf(stderr, "Failed to find static BPF maps\n");
-		bpf_object__close(obj);
-		config_free(&cfg);
-		return 1;
-	}
-
-	/* Find outer counter maps (ARRAY_OF_MAPS) */
-	int outer_v4 = bpf_object__find_map_fd_by_name(obj, "counters_v4");
-	int outer_v6 = bpf_object__find_map_fd_by_name(obj, "counters_v6");
-	int outer_vni = bpf_object__find_map_fd_by_name(obj, "counters_vni");
-
-	if (outer_v4 < 0 || outer_v6 < 0 || outer_vni < 0) {
-		fprintf(stderr, "Failed to find outer counter maps\n");
-		bpf_object__close(obj);
-		config_free(&cfg);
-		return 1;
-	}
+	/* Get outer counter map fds (ARRAY_OF_MAPS) */
+	int outer_v4 = bpf_map__fd(skel->maps.counters_v4);
+	int outer_v6 = bpf_map__fd(skel->maps.counters_v6);
+	int outer_vni = bpf_map__fd(skel->maps.counters_vni);
 
 	/* Get initial inner map fds.
-	 * dup() so we can close them independently of libbpf's internal fds. */
+	 * dup() so we can close them independently of the skeleton's fds. */
 	struct inner_map_fds cur = {
-		.v4  = { dup(bpf_object__find_map_fd_by_name(obj, "egress_v4")),
-			 dup(bpf_object__find_map_fd_by_name(obj, "ingress_v4")) },
-		.v6  = { dup(bpf_object__find_map_fd_by_name(obj, "egress_v6")),
-			 dup(bpf_object__find_map_fd_by_name(obj, "ingress_v6")) },
-		.vni = dup(bpf_object__find_map_fd_by_name(obj, "vni_map")),
+		.v4  = { dup(bpf_map__fd(skel->maps.egress_v4)),
+			 dup(bpf_map__fd(skel->maps.ingress_v4)) },
+		.v6  = { dup(bpf_map__fd(skel->maps.egress_v6)),
+			 dup(bpf_map__fd(skel->maps.ingress_v6)) },
+		.vni = dup(bpf_map__fd(skel->maps.vni_map)),
 	};
 
 	if (cur.v4[0] < 0 || cur.v4[1] < 0 ||
 	    cur.v6[0] < 0 || cur.v6[1] < 0 || cur.vni < 0) {
-		fprintf(stderr, "Failed to find inner counter maps\n");
+		fprintf(stderr, "Failed to dup inner counter map fds\n");
 		close_inner_maps(&cur);
-		bpf_object__close(obj);
+		traffic_account_bpf__destroy(skel);
 		config_free(&cfg);
 		return 1;
 	}
 
-	/* Populate maps */
-	if (populate_config_map(config_fd, &cfg) < 0 ||
-	    populate_regions(regions_fd, regions6_fd,
-			    cfg.regions, cfg.n_regions) < 0 ||
+	/* Populate LPM maps */
+	if (populate_regions(regions_fd, regions6_fd,
+			     cfg.regions, cfg.n_regions) < 0 ||
 	    populate_infra(dst_infra_fd, dst_infra6_fd,
-			       cfg.infra, cfg.n_infra) < 0) {
+			   cfg.infra, cfg.n_infra) < 0) {
 		close_inner_maps(&cur);
-		bpf_object__close(obj);
+		traffic_account_bpf__destroy(skel);
 		config_free(&cfg);
 		return 1;
 	}
@@ -942,10 +950,10 @@ int main(int argc, char **argv)
 	/* Attach XDP (ingress) if needed */
 	struct bpf_link *xdp_link = NULL;
 	if (cfg.direction != DIR_EGRESS) {
-		xdp_link = attach_xdp(xdp_prog, ifindex);
+		xdp_link = attach_xdp(skel->progs.xdp_traffic_account, ifindex);
 		if (!xdp_link) {
 			close_inner_maps(&cur);
-			bpf_object__close(obj);
+			traffic_account_bpf__destroy(skel);
 			config_free(&cfg);
 			return 1;
 		}
@@ -954,11 +962,11 @@ int main(int argc, char **argv)
 	/* Attach TC (egress) if needed */
 	int tc_attached = 0;
 	if (cfg.direction != DIR_INGRESS) {
-		if (attach_tc(tc_prog, ifindex) < 0) {
+		if (attach_tc(skel->progs.tc_traffic_account, ifindex) < 0) {
 			if (xdp_link)
 				bpf_link__destroy(xdp_link);
 			close_inner_maps(&cur);
-			bpf_object__close(obj);
+			traffic_account_bpf__destroy(skel);
 			config_free(&cfg);
 			return 1;
 		}
@@ -985,7 +993,7 @@ int main(int argc, char **argv)
 			if (tc_attached) detach_tc(ifindex);
 			if (xdp_link) bpf_link__destroy(xdp_link);
 			close_inner_maps(&cur);
-			bpf_object__close(obj);
+			traffic_account_bpf__destroy(skel);
 			config_free(&cfg);
 			return 1;
 		}
@@ -995,7 +1003,7 @@ int main(int argc, char **argv)
 			if (tc_attached) detach_tc(ifindex);
 			if (xdp_link) bpf_link__destroy(xdp_link);
 			close_inner_maps(&cur);
-			bpf_object__close(obj);
+			traffic_account_bpf__destroy(skel);
 			config_free(&cfg);
 			return 1;
 		}
@@ -1024,7 +1032,7 @@ int main(int argc, char **argv)
 			/* Flush counters before reload — region IDs may change */
 			poll_counters(outer_v4, outer_v6, outer_vni, &cur,
 				      exp_ptr, verbose, cfg.direction);
-			reload_config(config_path, &cfg, config_fd,
+			reload_config(config_path, &cfg, skel,
 				      regions_fd, regions6_fd,
 				      dst_infra_fd, dst_infra6_fd);
 		}
@@ -1045,7 +1053,7 @@ int main(int argc, char **argv)
 	if (xdp_link)
 		bpf_link__destroy(xdp_link);
 	close_inner_maps(&cur);
-	bpf_object__close(obj);
+	traffic_account_bpf__destroy(skel);
 	config_free(&cfg);
 
 	return 0;

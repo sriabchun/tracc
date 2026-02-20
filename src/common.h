@@ -3,10 +3,6 @@
 
 #include <linux/types.h>
 
-/* Config map indices */
-#define CFG_VXLAN_PORT     0
-#define CFG_VXLAN_VNI      1  /* VNI to account (required) */
-
 /* Sentinel dst_region_id for destinations outside any defined region */
 #define DST_REGION_ID_NONE  0xFFFFFFFF
 
@@ -17,7 +13,6 @@
 #define MAX_COUNTERS   262144  /* 256K src_ip × region pairs */
 #define MAX_SUBNETS    16384
 #define MAX_INFRA_SUBNETS  4096    /* max infrastructure CIDRs */
-#define MAX_CONFIG     8
 #define MAX_VNIS       16384   /* max distinct VNIs for per-VNI accounting */
 
 /* --- IPv4 structures --- */

@@ -15,14 +15,12 @@ struct vxlanhdr {
 	__be32 vx_vni;    /* VNI(24b) + Reserved(8b) */
 };
 
-/* --- Maps --- */
+/* --- Configuration globals (mmap'd from userspace via skeleton) --- */
 
-struct {
-	__uint(type, BPF_MAP_TYPE_ARRAY);
-	__uint(max_entries, MAX_CONFIG);
-	__type(key, __u32);
-	__type(value, __u32);
-} config SEC(".maps");
+volatile __u32 cfg_vxlan_port = DEFAULT_VXLAN_PORT;
+volatile __u32 cfg_vxlan_vni = 0;
+
+/* --- Maps --- */
 
 /* IPv4 LPM */
 struct {
@@ -138,9 +136,7 @@ struct {
 
 static __always_inline __u16 get_vxlan_port(void)
 {
-	__u32 cfg_idx = CFG_VXLAN_PORT;
-	__u32 *val = bpf_map_lookup_elem(&config, &cfg_idx);
-	return val ? (__u16)*val : DEFAULT_VXLAN_PORT;
+	return (__u16)cfg_vxlan_port;
 }
 
 /* --- Account an inner IPv4 packet --- */
@@ -332,16 +328,12 @@ static __always_inline int account_packet(void *data, void *data_end, int dir)
 		return -1;
 
 	/* Check VNI (upper 24 bits of vx_vni in network byte order) */
-	__u32 cfg_idx = CFG_VXLAN_VNI;
-	__u32 *cfg_vni = bpf_map_lookup_elem(&config, &cfg_idx);
-	if (!cfg_vni)
-		return -1;
 	__u32 pkt_vni = bpf_ntohl(vxlan->vx_vni) >> 8;
 
 	/* --- Inner Ethernet + IP --- */
 	struct ethhdr *inner_eth = (void *)(vxlan + 1);
 
-	if (pkt_vni == *cfg_vni) {
+	if (pkt_vni == cfg_vxlan_vni) {
 		/* Primary VNI: full per-IP/region accounting */
 		return account_inner(inner_eth, data_end, dir);
 	}
@@ -371,7 +363,7 @@ static __always_inline int account_packet(void *data, void *data_end, int dir)
 	return 0;
 }
 
-SEC("xdp")
+SEC("xdp.frags")
 int xdp_traffic_account(struct xdp_md *ctx)
 {
 	void *data = (void *)(long)ctx->data;

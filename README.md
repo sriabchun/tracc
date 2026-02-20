@@ -20,10 +20,9 @@ High-performance VXLAN traffic accounting using XDP/eBPF. Accounts packets and b
 
 ## Requirements
 
-- Linux kernel 5.10+ (XDP, TC, LPM trie, per-CPU hash maps, array-of-maps)
-- clang, llvm-strip (BPF compilation)
+- Linux kernel 6.1+ (XDP frags, BPF global mmap, batch map ops, array-of-maps)
+- clang, llvm-strip, bpftool (BPF compilation + skeleton generation)
 - libbpf-dev, libelf-dev, zlib1g-dev (userspace)
-- bpftool (optional, for debugging)
 
 ## Build
 
@@ -33,7 +32,8 @@ make
 
 Produces:
 - `build/traffic_account.bpf.o` — BPF object (XDP + TC programs)
-- `build/traffic-account` — userspace daemon
+- `build/traffic_account.skel.h` — BPF skeleton header (auto-generated)
+- `build/traffic-account` — userspace daemon (BPF object embedded)
 
 ## Configuration
 
@@ -85,7 +85,7 @@ Options:
 - `-c <config>` — config file path (required)
 - `-v` — verbose: print counters to stdout (auto-enabled when no collector configured)
 
-The BPF object file (`traffic_account.bpf.o`) must be in the working directory.
+The BPF object is embedded in the binary via skeleton — no external `.bpf.o` file needed at runtime.
 
 ## Output
 
