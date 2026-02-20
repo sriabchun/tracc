@@ -14,6 +14,7 @@ static uint8_t sendbuf[IPFIX_BUF_SIZE];
 static size_t sendpos;
 static uint16_t cur_set_tmpl;   /* template ID of currently open data set, 0 = none */
 static size_t   cur_set_start;  /* offset of current data set header */
+static uint32_t msg_seq_number; /* seq_number snapshot for current message header */
 
 static void buf_reset(void)
 {
@@ -72,6 +73,7 @@ int ipfix_init(struct ipfix_exporter *exp, const char *host, uint16_t port,
 	exp->collector_len = res->ai_addrlen;
 	freeaddrinfo(res);
 
+	msg_seq_number = 0;
 	buf_reset();
 	return 0;
 }
@@ -95,7 +97,7 @@ static void ipfix_send_msg(struct ipfix_exporter *exp)
 	put16((uint8_t *)&hdr->version, 0x000a);
 	put16((uint8_t *)&hdr->length, (uint16_t)sendpos);
 	put32((uint8_t *)&hdr->export_time, (uint32_t)time(NULL));
-	put32((uint8_t *)&hdr->seq_number, exp->seq_number);
+	put32((uint8_t *)&hdr->seq_number, msg_seq_number);
 	put32((uint8_t *)&hdr->obs_domain_id, exp->obs_domain_id);
 
 	ssize_t ret = sendto(exp->sockfd, sendbuf, sendpos, 0,
@@ -104,6 +106,7 @@ static void ipfix_send_msg(struct ipfix_exporter *exp)
 	if (ret < 0)
 		fprintf(stderr, "IPFIX: sendto: %s\n", strerror(errno));
 
+	msg_seq_number = exp->seq_number;
 	buf_reset();
 }
 
