@@ -6,6 +6,7 @@ High-performance VXLAN traffic accounting using XDP/eBPF. Accounts packets and b
 
 - **XDP ingress** + **TC egress** hooks for minimal overhead at 200 Gbps+
 - Per-CPU lock-free counters (no contention across cores)
+- Atomic map-swap polling — zero packet loss between read cycles
 - LPM trie for efficient subnet-to-region mapping
 - **IPv4 and IPv6** inner packet support (separate counter maps)
 - **IPv4 and IPv6** outer tunnel support
@@ -15,10 +16,11 @@ High-performance VXLAN traffic accounting using XDP/eBPF. Accounts packets and b
 - Configurable poll interval (default 30s)
 - Accounts inner IP payload size (excludes encapsulation overhead)
 - Non-VXLAN traffic passes through untouched
+- SIGHUP config reload (add/remove subnets without restart)
 
 ## Requirements
 
-- Linux kernel 5.10+ (XDP, TC, LPM trie, per-CPU hash maps)
+- Linux kernel 5.10+ (XDP, TC, LPM trie, per-CPU hash maps, array-of-maps)
 - clang, llvm-strip (BPF compilation)
 - libbpf-dev, libelf-dev, zlib1g-dev (userspace)
 - bpftool (optional, for debugging)
@@ -104,7 +106,7 @@ Three template types are exported:
 
 `obs_domain_id` is auto-derived from the interface IPv4 address (e.g. 10.0.0.1 → 0x0a000001).
 
-Counters are reset after each read. A `dst_region_id` of `0xFFFFFFFF` means the destination IP did not match any defined region.
+Counters are collected via atomic map swap — no packets are lost between poll cycles. A `dst_region_id` of `0xFFFFFFFF` means the destination IP did not match any defined region.
 
 ## Architecture
 
@@ -114,14 +116,18 @@ Packet path (per-packet, in kernel):
     Primary VNI:
       → Inner Eth → Inner IP → extract src_ip, dst_ip
       → LPM trie: dst_ip → dst_region_id
-      → PERCPU_HASH[{src_ip, dst_region_id}] += {1, inner_ip_len}
+      → ARRAY_OF_MAPS[dir] → PERCPU_HASH[{src_ip, dst_region_id}] += {1, inner_ip_len}
     Non-primary VNI:
       → Outer dst IP → infra LPM → dst_region_id
-      → PERCPU_HASH[{vni, dst_region_id, dir}] += {1, inner_ip_len}
+      → ARRAY_OF_MAPS[0] → PERCPU_HASH[{vni, dst_region_id, dir}] += {1, inner_ip_len}
   → XDP_PASS / TC_ACT_OK (no interference with forwarding)
 
 Userspace (every N seconds):
-  iterate PERCPU_HASH → sum per-CPU values → export via IPFIX → delete entries
+  create fresh empty inner maps
+  → swap into ARRAY_OF_MAPS (atomic, BPF sees new maps immediately)
+  → wait 10ms RCU grace period (drain in-flight BPF programs)
+  → iterate old maps (read-only, no contention) → sum per-CPU values → export via IPFIX
+  → close old maps (kernel frees memory)
 ```
 
 ## License
