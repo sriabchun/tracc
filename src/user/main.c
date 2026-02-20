@@ -576,7 +576,7 @@ static void poll_counters_v4(int map_fd, const char *timebuf, const char *dir,
 					char ip_str[INET_ADDRSTRLEN];
 					struct in_addr sa = { .s_addr = next_key.src_ip };
 					inet_ntop(AF_INET, &sa, ip_str, sizeof(ip_str));
-					printf("%s dir=%s ip=%s region=%u packets=%llu bytes=%llu\n",
+					printf("%s dir=%s ip=%s region=0x%08x packets=%llu bytes=%llu\n",
 					       timebuf, dir, ip_str, next_key.dst_region_id,
 					       (unsigned long long)total_pkts,
 					       (unsigned long long)total_bytes);
@@ -613,7 +613,7 @@ static void poll_counters_v6(int map_fd, const char *timebuf, const char *dir,
 					char ip_str[INET6_ADDRSTRLEN];
 					inet_ntop(AF_INET6, next_key.src_ip6,
 						  ip_str, sizeof(ip_str));
-					printf("%s dir=%s ip=%s region=%u packets=%llu bytes=%llu\n",
+					printf("%s dir=%s ip=%s region=0x%08x packets=%llu bytes=%llu\n",
 					       timebuf, dir, ip_str, next_key.dst_region_id,
 					       (unsigned long long)total_pkts,
 					       (unsigned long long)total_bytes);
@@ -646,7 +646,7 @@ static void poll_vni_counters(int map_fd, const char *timebuf,
 							 total_pkts, total_bytes,
 							 next_key.dir ? 0 : 1);
 				if (verbose) {
-					printf("%s dir=%s vni=%u dst_region_id=%u packets=%llu bytes=%llu\n",
+					printf("%s dir=%s vni=%u dst_region_id=0x%08x packets=%llu bytes=%llu\n",
 					       timebuf,
 					       next_key.dir ? "ingress" : "egress",
 					       next_key.vni,
